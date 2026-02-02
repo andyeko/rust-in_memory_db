@@ -1,0 +1,30 @@
+# Rust/Cargo
+/target/
+/**/target/
+Cargo.lock
+
+# Build artifacts
+/build/
+tmp/
+*.log
+*.o
+*.rlib
+*.rmeta
+*.d
+
+# Incremental and caches
+/target/**
+/debug/
+/incremental/
+
+# Editors/IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Misc
+coverage/
+.cache/
