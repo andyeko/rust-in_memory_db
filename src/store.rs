@@ -215,4 +215,113 @@ mod tests {
         assert_eq!(store.get("city"), Some(&"Portland".to_string()));
         assert_eq!(store.get("country"), None);
     }
+
+    // This test intentionally uses unsafe raw-pointer aliasing to demonstrate
+    // what can go wrong when a borrowed reference is read while another
+    // thread concurrently deletes the value. The behavior is undefined and
+    // the test is ignored by default to avoid crashing CI or local runs.
+    #[test]
+    #[ignore]
+    fn unsafe_concurrent_get_and_delete() {
+        use std::thread;
+        use std::time::Duration;
+
+        // Allocate the store on the heap and get a raw pointer so we can
+        // dereference it unsafely in multiple threads.
+        let mut boxed = Box::new(KeyValueStore::new());
+        boxed.set("k".to_string(), "v".to_string());
+        let ptr: *mut KeyValueStore = Box::into_raw(boxed);
+
+        // Use the pointer's integer address (usize) to move a Send value into
+        // the spawned threads. Raw pointers are not considered `Send` here,
+        // but `usize` is Send, so cast and cast back inside the thread.
+        let addr = ptr as usize;
+
+        // t1: take a borrowed reference via `get` and convert it to a raw
+        // pointer; sleep so t2 can delete the key before t1 reads via the
+        // raw pointer (this read is UB if the value has been removed).
+        let p1 = addr;
+        let t1 = thread::spawn(move || {
+            unsafe {
+                let p1: *mut KeyValueStore = p1 as *mut KeyValueStore;
+                let kv_ref: &KeyValueStore = &*p1;
+                let val_ref: &String = kv_ref.get("k").unwrap();
+                let val_ptr: *const String = val_ref as *const String;
+
+                // Allow t2 to run and delete the entry.
+                thread::sleep(Duration::from_millis(100));
+
+                // UB: dereferencing `val_ptr` after the entry may have been
+                // removed by t2. This demonstrates the kind of invalid
+                // memory access that can occur without proper synchronization.
+                (&*val_ptr).clone()
+            }
+        });
+
+        // t2: delete the key while t1 is still holding the borrowed pointer.
+        let p2 = addr;
+        let t2 = thread::spawn(move || {
+            unsafe {
+                // Small sleep so t1 obtains the raw pointer first.
+                thread::sleep(Duration::from_millis(50));
+                let p2: *mut KeyValueStore = p2 as *mut KeyValueStore;
+                let kv_mut: &mut KeyValueStore = &mut *p2;
+                kv_mut.delete("k");
+            }
+        });
+
+        let v = t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Reconstruct the Box to properly drop the store and avoid leaking.
+        unsafe { Box::from_raw(ptr); }
+
+        // The value may or may not be "v" depending on timing and UB; this
+        // assert is present to show what a successful (non-crashing) run
+        // might look like — but running this test is unsafe by design.
+        assert_eq!(v, "v".to_string());
+    }
+
+    #[test]
+    fn safe_concurrent_clone_and_delete() {
+        use std::sync::{Arc, RwLock};
+        use std::thread;
+        use std::time::Duration;
+
+        // Prepare a store with an entry and wrap it for shared access.
+        let mut s = KeyValueStore::new();
+        s.set("k".to_string(), "v".to_string());
+        let store = Arc::new(RwLock::new(s));
+
+        // Reader: take a read lock, clone the value (owned), then sleep.
+        let r = store.clone();
+        let reader = thread::spawn(move || {
+            let val_opt = {
+                let guard = r.read().unwrap();
+                guard.get("k").cloned() // Option<String>
+            }; // guard dropped here
+
+            // Simulate work after obtaining the owned value.
+            thread::sleep(Duration::from_millis(100));
+            val_opt
+        });
+
+        // Writer: wait a bit so reader clones first, then delete the key.
+        let w = store.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let mut guard = w.write().unwrap();
+            guard.delete("k");
+        });
+
+        let read_value = reader.join().unwrap();
+        writer.join().unwrap();
+
+        // Reader must have received the owned value even though writer deleted it later.
+        assert_eq!(read_value, Some("v".to_string()));
+
+        // Store should no longer contain the key.
+        let final_state = store.read().unwrap();
+        assert_eq!(final_state.get("k"), None);
+    }
 }
